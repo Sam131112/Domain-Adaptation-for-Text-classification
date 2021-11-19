@@ -18,6 +18,7 @@ import datasets
 import numpy as np
 import random
 
+# Baseline Bert-SO from the paper 
 
 def fix_all_seeds(seed):
     np.random.seed(seed)
