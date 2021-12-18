@@ -3,6 +3,7 @@ import transformers
 import os
 import time
 import pickle
+from itertools import permutations
 import math
 from collections import Counter
 print(transformers.__version__)
@@ -41,12 +42,20 @@ class CombinedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         token_data,mlm_data = self.data[idx][0],self.data[idx][1]
         return token_data, mlm_data
+
+    
 def get_data_slice(i):
-                    inputs = {
-                   'input_ids':i['input_ids'].squeeze(1).cuda(),\
-                   'attention_mask':i['attention_mask'].squeeze(1).cuda(),\
-                   'labels':i['labels'].squeeze(1).cuda(),
-                       }
+                    if "labels" in i:
+                        inputs = {
+                       'input_ids':i['input_ids'].squeeze(1),\
+                       'attention_mask':i['attention_mask'].squeeze(1),\
+                       'labels':i['labels'].squeeze(1),
+                           }
+                    else:
+                        inputs = {
+                       'input_ids':i['input_ids'].squeeze(1),\
+                       'attention_mask':i['attention_mask'].squeeze(1),
+                           }                     
                     return inputs 
 
 def preprocess_function(examples):
@@ -87,26 +96,34 @@ def create_data_list(data1,data2):
         small = data2
         big = data1
     for i in range(len(small)):
-        store.append((big[i],small[i]))
+        store.append((small[i],big[i]))
     for j in range(i,len(big),1):
         sample = int(np.random.randint(0,len(small),1)[0])
-        store.append((big[j],small[sample]))
+        store.append((small[sample],big[j]))
     return store
 
 
-class ReverseLayerF(Function):
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = lambda_
+        return x.clone()
 
     @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
+    def backward(ctx, grads):
+        lambda_ = ctx.lambda_
+        lambda_ = grads.new_tensor(lambda_)
+        dx = -lambda_ * grads
+        return dx, None
 
-        return x.view_as(x)
 
-    @staticmethod
-    def backward(ctx, grad_output):
-        output = grad_output.neg() * ctx.alpha
+class GradientReversal(torch.nn.Module):
+    def __init__(self, lambda_=1):
+        super(GradientReversal, self).__init__()
+        self.lambda_ = lambda_
 
-        return output, None
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_)
     
 class SentiMentClf(torch.nn.Module):
     def __init__(self,base_config,num_labels):
@@ -136,6 +153,33 @@ class SentiMentClf(torch.nn.Module):
 
 
 
+class Discriminator(torch.nn.Module):
+    def __init__(self,base_config):
+        super().__init__()
+        self.base_config = base_config
+        self.Grl = GradientReversal()
+        self.dropout = torch.nn.Dropout(self.base_config.hidden_dropout_prob)
+        self.classifier = torch.nn.Linear(self.base_config.hidden_size,1)
+        self._init_weights(self.classifier)
+    
+    
+    def _init_weights(self, modules):
+        """Initialize the weights"""
+        for module in modules.modules():
+                if isinstance(module, torch.nn.Linear):
+                    module.weight.data.normal_(mean=0.0, std=self.base_config.initializer_range)
+                    if module.bias is not None:
+                        module.bias.data.zero_()
+                elif isinstance(module, torch.nn.LayerNorm):
+                    module.bias.data.zero_()
+                    module.weight.data.fill_(1.0)
+    
+    
+    def forward(self,data):
+        data = self.Grl(data)
+        clf_out = self.classifier(self.dropout(data))
+        return clf_out   
+    
 
 class DANN(torch.nn.Module):
     def __init__(self):
@@ -189,8 +233,7 @@ class DANNauto(torch.nn.Module):
         self.pooler = BertPooler(self.base_model.config)
         self._init_weights(self.pooler)
         self.task_classifier = SentiMentClf(self.base_model.config,2)
-        self.domain_classifier = SentiMentClf(self.base_model.config,2)
-        self.my_grad = ReverseLayerF.apply
+        self.domain_classifier = Discriminator(self.base_model.config)
         
     def _init_weights(self, modules):
         """Initialize the weights"""
@@ -204,25 +247,24 @@ class DANNauto(torch.nn.Module):
                     module.weight.data.fill_(1.0)
         
 
-    def forward(self,task_data,domain_data=False,train_mode=True):
+    def forward(self,data,train_mode=True):
         if train_mode:
-            out = self.base_model(input_ids=task_data['input_ids'], \
-                               attention_mask=task_data['attention_mask'])           
+            out = self.base_model(input_ids=data['input_ids'], \
+                               attention_mask=data['attention_mask'])           
             out = self.pooler(out.last_hidden_state)
-            task_out = self.task_classifier(out)
-            
-            out = self.base_model(input_ids=domain_data['input_ids'], \
-                               attention_mask=domain_data['attention_mask'])           
-            out = self.pooler(out.last_hidden_state)
-            domain_out = self.domain_classifier(self.my_grad(out,1))
+            task_out = out[:16]
+            task_out = self.task_classifier(task_out)   # 16 x 2
+            domain_out = self.domain_classifier(out)    # 32 x 1
             return task_out,domain_out
         else:
-            out = self.base_model(input_ids=task_data['input_ids'], \
-                               attention_mask=task_data['attention_mask'])           
+            out = self.base_model(input_ids=data['input_ids'], \
+                               attention_mask=data['attention_mask'])           
             out = self.pooler(out.last_hidden_state)
             task_out = self.task_classifier(out)
             return task_out
 
+        
+        
 def prepare_data(in_domain,out_domain):
         seed = np.random.randint(0,10000)
         fix_all_seeds(seed)
@@ -235,14 +277,16 @@ def prepare_data(in_domain,out_domain):
         dataset = datasets.concatenate_datasets([dataset['train']])
         dataset_trg = dataset.train_test_split(0.2,shuffle=True)
 
-        if os.path.exists(f'Multitask_data/multitask_{in_domain}_n_{out_domain}_data.csv'):
-            dataset_domain = load_dataset('csv',delimiter="\t",\
-                                          data_files=f'Multitask_data/multitask_{in_domain}_n_{out_domain}_data.csv')
-        elif os.path.exists(f'Multitask_data/multitask_{out_domain}_n_{in_domain}_data.csv'):
-            dataset_domain = load_dataset('csv',delimiter="\t",\
-                                          data_files=f'Multitask_data/multitask_{out_domain}_n_{in_domain}_data.csv')
-        dataset = datasets.concatenate_datasets([dataset_domain['train']])
-        dataset_domain = dataset.train_test_split(0.2,shuffle=True)
+        #if os.path.exists(f'Multitask_data/multitask_{in_domain}_n_{out_domain}_data.csv'):
+        #    dataset_domain = load_dataset('csv',delimiter="\t",\
+        #                                  data_files=f'Multitask_data/multitask_{in_domain}_n_{out_domain}_data.csv')
+        #elif os.path.exists(f'Multitask_data/multitask_{out_domain}_n_{in_domain}_data.csv'):
+        #    dataset_domain = load_dataset('csv',delimiter="\t",\
+        #                                  data_files=f'Multitask_data/multitask_{out_domain}_n_{in_domain}_data.csv')
+        
+        dataset_domain = load_dataset('csv',delimiter="\t",data_files=f'Dann_Data/{out_domain}.csv')
+        dataset_domain = datasets.concatenate_datasets([dataset_domain['train']])
+        #dataset_domain = dataset.train_test_split(0.2,shuffle=True)
         
         processed_datasets_src = dataset_src.map(preprocess_function,batched=True,\
                                       desc="Running tokenizer on dataset",)
@@ -271,12 +315,13 @@ def prepare_data(in_domain,out_domain):
                                              collate_fn=default_data_collator,\
                                              batch_size = 16,drop_last=True)
         
-        train_dataloader_domain = DataLoader(processed_domain['train'],\
+        train_dataloader_domain = DataLoader(processed_domain,\
                                              collate_fn=default_data_collator,\
                                              batch_size = 1,drop_last=True)
         
         
         train_data = create_data_equal(train_dataloader_src,train_dataloader_domain)
+        
         print("Check Data Sizes",len(train_dataloader_src),len(train_dataloader_domain),len(train_data))
         train_final = CombinedDataset(train_data)
         final_train_loader = DataLoader(train_final, batch_size=16,\
@@ -392,8 +437,8 @@ def run_train_a(train_loader,eval_loader):
                 epoch_loss = 0.0
                 domain_epoch_loss = 0.0
                 for step, batch in enumerate(train_loader):
-                    input1 = get_data_slice(batch[1])
-                    input2 = get_data_slice(batch[0])
+                    input1 = get_data_slice(batch[0])
+                    input2 = get_data_slice(batch[1])
                     out1,out2 = model(input1,input2,True)
                     task_loss = fct_loss(out1,input1['labels'])
                     domain_loss = fct_loss(out2,input2['labels'])
@@ -445,11 +490,12 @@ def run_train_b(train_loader,eval_loader):
                         ]
             optimizer = AdamW(optimizer_grouped, lr=5e-5)
             fct_loss = CrossEntropyLoss()
+            dcr_loss = BCEWithLogitsLoss()
             scheduler = ExponentialLR(optimizer=optimizer,gamma=0.85,last_epoch=-1,verbose=True)
             
             best_f1 = -1
             best_loss = 1e5
-            for epoch in range(5):
+            for epoch in range(10):
                 print(f'EPOCH NO: {epoch}')
                 model.eval()
                 val_loss = 0.0
@@ -460,7 +506,7 @@ def run_train_b(train_loader,eval_loader):
                         input1 = {'input_ids':batch['input_ids'].cuda(),\
                                   'attention_mask':batch['attention_mask'].cuda(),\
                                      'labels':batch['labels'].cuda()}
-                        out  = model(input1,False,False)
+                        out  = model(input1,False)
                         token_predictions_store.append(out)
                         token_gold_store.append(input1['labels'])
                         loss = fct_loss(out,input1['labels'])
@@ -487,11 +533,15 @@ def run_train_b(train_loader,eval_loader):
                 domain_epoch_loss = 0.0
                 for step, batch in enumerate(train_loader):
                     optimizer.zero_grad()
-                    input1 = get_data_slice(batch[1])
-                    input2 = get_data_slice(batch[0])
-                    out1,out2 = model(input1,input2,True)
-                    task_loss = fct_loss(out1,input1['labels'])
-                    domain_loss = fct_loss(out2,input2['labels'])
+                    input1 = get_data_slice(batch[0])
+                    input2 = get_data_slice(batch[1])
+                    domain_labels = torch.cat([torch.ones(16),torch.zeros(16)]).cuda()
+                    data = {'input_ids':torch.cat((input1['input_ids'],input2['input_ids']),0).cuda(),\
+                           'attention_mask':torch.cat((input1['attention_mask'],input2['attention_mask']),0).cuda()}
+                    out1,out2 = model(data,True)
+                    #print(out1.shape,out2.shape)
+                    task_loss = fct_loss(out1,input1['labels'].cuda())
+                    domain_loss = dcr_loss(out2.squeeze(1),domain_labels)
                     epoch_loss = epoch_loss + task_loss.item()
                     domain_epoch_loss = domain_epoch_loss + domain_loss.item()
                     loss = task_loss + domain_loss
@@ -516,7 +566,7 @@ def run_test(data):
                         input1 = {'input_ids':batch['input_ids'].cuda(),\
                                   'attention_mask':batch['attention_mask'].cuda(),\
                                      'labels':batch['labels'].cuda()}
-                        out  = model(input1,False,False)
+                        out  = model(input1,False)
                         token_predictions_store.append(out)
                         token_gold_store.append(input1['labels'])
 
@@ -536,16 +586,18 @@ def main(in_domain,out_domains):
     seed = run_train_b(train_loader,eval_loader)
     return (seed,run_test(test_loader))
 
+
+
+
 start_time = time.perf_counter()
-out_domains = "dvd"
-in_domains = ['music','books','kitchen_housewares','electronics']
-for in_domain in in_domains:
-    test_best = {}
-    for i in range(5):
-            out = main(in_domain,out_domains)
-            test_best[out[0]] = out[1]
-    print(test_best.values(),np.mean(list(test_best.values())),np.std(list(test_best.values())))
-    fname = out_domains+"_"+in_domain+".p"
-    pickle.dump(test_best,open(f'baseline_out/Dann/{fname}',"wb"))
+f_name = [z for z in permutations(['dvd','music','books','kitchen_housewares','electronics'],2)]
+for in_domain,out_domains in f_name:
+            test_best = {}
+            for i in range(5):
+                    out = main(in_domain,out_domains)
+                    test_best[out[0]] = out[1]
+            print(test_best.values(),np.mean(list(test_best.values())),np.std(list(test_best.values())))
+            fname = out_domains+"_"+in_domain+".p"
+            pickle.dump(test_best,open(f'baseline_out/Dann/{fname}',"wb"))
 end_time = time.perf_counter()
 print(f'Time Elapsed {(end_time-start_time)/60.0}')
