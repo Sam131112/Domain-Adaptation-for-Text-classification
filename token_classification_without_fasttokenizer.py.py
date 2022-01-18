@@ -1,4 +1,5 @@
 # Domain Adaptation for Token Classification task (NER)
+# Application of BertTweet for NER 
 
 import transformers
 import os
